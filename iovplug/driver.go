@@ -17,8 +17,10 @@ package iovplug
 import (
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"net"
 	"net/http"
+	"strconv"
 
 	"github.com/vishvananda/netlink"
 )
@@ -27,8 +29,11 @@ type driver struct {
 	config     *Config
 	networkID  string
 	hostLink   netlink.Link
+	ip         net.IP
+	ipnet      *net.IPNet
 	usedIPs    map[string]string
-	interfaces map[string]string
+	interfaces map[string][]net.IP
+	iom        *ioModuleClient
 }
 
 func NewDriver(config *Config) (*driver, error) {
@@ -47,6 +52,22 @@ func NewDriver(config *Config) (*driver, error) {
 	if len(config.Subnet) == 0 {
 		config.Subnet = addrs[0].IPNet.String()
 		Debug.Printf("using interface subnet %s\n", config.Subnet)
+
+		if len(config.Gateway) == 0 {
+			routes, err := netlink.RouteList(link, netlink.FAMILY_ALL)
+			if err != nil {
+				return nil, err
+			}
+			for _, route := range routes {
+				if route.Dst == nil {
+					config.Gateway = route.Gw.String()
+					Debug.Printf("using gateway %s\n", config.Gateway)
+				}
+			}
+			if len(config.Gateway) == 0 {
+				return nil, fmt.Errorf("cannot autoselect default gateway")
+			}
+		}
 	}
 
 	ip, ipnet, err := net.ParseCIDR(config.Subnet)
@@ -54,27 +75,13 @@ func NewDriver(config *Config) (*driver, error) {
 		return nil, err
 	}
 
-	if len(config.Gateway) == 0 {
-		routes, err := netlink.RouteList(link, netlink.FAMILY_ALL)
-		if err != nil {
-			return nil, err
-		}
-		for _, route := range routes {
-			if route.Dst == nil {
-				config.Gateway = route.Gw.String()
-				Debug.Printf("using gateway %s\n", config.Gateway)
-			}
-		}
-		if len(config.Gateway) == 0 {
-			return nil, fmt.Errorf("cannot autoselect default gateway")
-		}
-	}
-
 	d := &driver{
 		config:     config,
+		ip:         ip,
+		ipnet:      ipnet,
 		hostLink:   link,
 		usedIPs:    make(map[string]string),
-		interfaces: make(map[string]string),
+		interfaces: make(map[string][]net.IP),
 	}
 	d.usedIPs[ip.String()] = ""
 	Debug.Printf("consuming %s\n", ip)
@@ -90,6 +97,15 @@ func NewDriver(config *Config) (*driver, error) {
 			Debug.Printf("consuming %s\n", addr.IP)
 		}
 	}
+
+	//d.iom = &ioModuleClient{
+	//	client:  &http.Client{},
+	//	baseUrl: "http://localhost:5000",
+	//}
+	//if err := d.iom.discover(); err != nil {
+	//	return nil, err
+	//}
+
 	return d, nil
 }
 
@@ -107,6 +123,17 @@ func (d *driver) createNetwork(w http.ResponseWriter, r *http.Request) {
 	if len(d.networkID) != 0 {
 		panic(fmt.Errorf("driver already has a network defined"))
 	}
+
+	route := &netlink.Route{
+		LinkIndex: d.hostLink.Attrs().Index,
+		Scope:     netlink.SCOPE_LINK,
+		Dst:       d.ipnet,
+	}
+	if err := netlink.RouteAdd(route); err != nil {
+		panic(err)
+	}
+
+	//d.iom.createIOModule(&req)
 
 	d.networkID = req.NetworkID
 	Debug.Println("driver.createNetwork", req.NetworkID, req.Options)
@@ -129,7 +156,17 @@ func (d *driver) deleteNetwork(w http.ResponseWriter, r *http.Request) {
 		panic(fmt.Errorf("no network with ID %s", req.NetworkID))
 	}
 
+	route := &netlink.Route{
+		LinkIndex: d.hostLink.Attrs().Index,
+		Scope:     netlink.SCOPE_LINK,
+		Dst:       d.ipnet,
+	}
+	if err := netlink.RouteDel(route); err != nil {
+		Warn.Printf("RouteDel failed: %s\n", err.Error())
+	}
+
 	d.networkID = ""
+	//d.iom.deleteIOModule(&req)
 
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprint(w, `{}`)
@@ -171,6 +208,62 @@ func incrementIP(ip net.IP) {
 	}
 }
 
+func endpointToLink(endpointID string) string {
+	return endpointID[:5]
+}
+
+func tagFromEndpointOptions(options map[string]interface{}) string {
+	obj, ok := options["com.docker.network.endpoint.exposedports"]
+	if !ok {
+		return ""
+	}
+
+	exposedPorts, ok := obj.([]interface{})
+	if !ok {
+		return ""
+	}
+
+	Debug.Printf("parsing exposedports list %v\n", exposedPorts)
+	for _, obj := range exposedPorts {
+		exposedPort, ok := obj.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		port, ok := exposedPort["Port"]
+		if !ok {
+			continue
+		}
+		if val, ok := port.(float64); ok {
+			return strconv.Itoa(int(val))
+		}
+	}
+	return ""
+}
+
+func ipsFromEndpointRequest(req *createEndpointRequest) (ip4 net.IP, ip6 net.IP) {
+	if req.Interface.Address != "" {
+		ip, _, err := net.ParseCIDR(req.Interface.Address)
+		if err != nil {
+			panic(err)
+		}
+		if ip.To4() == nil {
+			panic(fmt.Errorf("expected v4 address"))
+		}
+		ip4 = ip.To4()
+	}
+	if req.Interface.AddressIPv6 != "" {
+		ip, _, err := net.ParseCIDR(req.Interface.AddressIPv6)
+		if err != nil {
+			panic(err)
+		}
+		if ip.To16() == nil {
+			panic(fmt.Errorf("expected v6 address"))
+		}
+		ip6 = ip.To16()
+	}
+	return
+}
+
 func (d *driver) createEndpoint(w http.ResponseWriter, r *http.Request) {
 	var req createEndpointRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -182,37 +275,27 @@ func (d *driver) createEndpoint(w http.ResponseWriter, r *http.Request) {
 		panic(fmt.Errorf("no network with ID %s", req.NetworkID))
 	}
 
-	ip, ipnet, err := net.ParseCIDR(d.config.Subnet)
-	if err != nil {
-		panic(err)
-	}
-	var newIP net.IPNet
-	for ip := ip.Mask(ipnet.Mask); ipnet.Contains(ip); incrementIP(ip) {
-		if _, ok := d.usedIPs[ip.String()]; !ok {
-			newIP.IP = ip
-			newIP.Mask = ipnet.Mask
-			break
+	ip4, ip6 := ipsFromEndpointRequest(&req)
+
+	if tag := tagFromEndpointOptions(req.Options); tag != "" {
+		Debug.Printf("set ip2grp %s -> %d\n", req.Interface.Address, tag)
+		file := fmt.Sprintf("/run/bcc/foo/maps/ip2grp/{ 0x%02x%02x%02x%02x 0x0  }",
+			ip4[0], ip4[1], ip4[2], ip4[3])
+		if err := ioutil.WriteFile(file, []byte(tag), 0644); err != nil {
+			panic(err)
 		}
 	}
-	if newIP.IP == nil {
-		panic(fmt.Errorf("unable to allocate IP in subnet"))
-	}
 
-	d.interfaces[req.EndpointID] = newIP.IP.String()
-	d.usedIPs[newIP.IP.String()] = req.EndpointID
-	Info.Printf("new IP %s\n", newIP.IP)
-
-	resp := &endpointResponse{
-		Interface: &endpoint{
-			Address: newIP.String(),
-		},
+	ips := []net.IP{ip4, ip6}
+	d.interfaces[req.EndpointID] = ips
+	for _, ip := range ips {
+		if ip != nil {
+			d.usedIPs[ip.String()] = req.EndpointID
+		}
 	}
-	Info.Printf("return Address: %s\n", newIP.String())
 
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		panic(err)
-	}
+	fmt.Fprint(w, `{"Value": {}}`)
 }
 
 type endpointRequest struct {
@@ -230,16 +313,30 @@ func (d *driver) deleteEndpoint(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		panic(err)
 	}
+	Debug.Printf("driver.deleteEndpoint %s\n", &req)
 
-	ip, ok := d.interfaces[req.EndpointID]
+	ips, ok := d.interfaces[req.EndpointID]
 	if !ok {
 		panic(fmt.Errorf("cannot find endpoint %s", req.EndpointID))
 	}
 
-	defer delete(d.interfaces, req.EndpointID)
-	defer delete(d.usedIPs, ip)
+	linkName := endpointToLink(req.EndpointID)
 
-	Debug.Printf("driver.deleteEndpoint %s\n", &req)
+	defer delete(d.interfaces, req.EndpointID)
+	for _, ip := range ips {
+		if ip != nil {
+			defer delete(d.usedIPs, ip.String())
+		}
+	}
+
+	if link, err := netlink.LinkByName(linkName); err == nil {
+		if err := netlink.LinkDel(link); err != nil {
+			Warn.Printf("unable to cleanup link %s while deleting endpoint", linkName)
+		}
+	} else {
+		Warn.Printf("unable to find link %s while deleting endpoint", linkName)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprint(w, `{}`)
 }
@@ -283,6 +380,14 @@ type joinResponse struct {
 	StaticRoutes  []*staticRoute
 }
 
+type moduleData struct {
+	modType     string `json:"module_type"`
+	displayName string `json:"display_name"`
+	config      string `json:"config"`
+}
+
+// Called when the container actually needs the endpoint, create the virtual
+// device now
 func (d *driver) join(w http.ResponseWriter, r *http.Request) {
 	var req joinRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -294,23 +399,38 @@ func (d *driver) join(w http.ResponseWriter, r *http.Request) {
 
 	newLink := &netlink.IPVlan{
 		LinkAttrs: netlink.LinkAttrs{
-			Name:        req.EndpointID[:5],
+			Name:        endpointToLink(req.EndpointID),
 			ParentIndex: d.hostLink.Attrs().Index,
 		},
-		Mode: netlink.IPVLAN_MODE_L2,
+		Mode: netlink.IPVLAN_MODE_L3,
 	}
 	if err := netlink.LinkAdd(newLink); err != nil {
 		panic(err)
 	}
+	Debug.Printf("link added, index %d\n", newLink.Index)
+
 	if err := netlink.LinkSetUp(newLink); err != nil {
 		panic(err)
 	}
+
+	//d.iom.connectLink(d.networkID, newLink.Name)
+
 	resp := &joinResponse{
 		InterfaceName: &interfaceName{
 			SrcName:   newLink.Name,
 			DstPrefix: "eth",
 		},
-		Gateway: d.config.Gateway,
+		// uncomment for L3 mode
+		StaticRoutes: []*staticRoute{
+			&staticRoute{
+				Destination: "0.0.0.0/0",
+				RouteType:   1,
+				NextHop:     "",
+			},
+		},
+	}
+	if len(d.config.Gateway) > 0 {
+		resp.Gateway = d.config.Gateway
 	}
 
 	w.Header().Set("Content-Type", "application/json")

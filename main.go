@@ -32,7 +32,7 @@ func init() {
 	const (
 		subnetDefault    = ""
 		subnetHelp       = "subnet to assign the host group"
-		socketDefault    = "/run/docker/plugins/iov.sock"
+		socketDefault    = "/run/docker/plugins/iovisor.sock"
 		socketHelp       = "docker plugin socket file"
 		interfaceDefault = "eth0"
 		interfaceHelp    = "interface to take ipvlans from"
