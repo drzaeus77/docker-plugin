@@ -15,11 +15,13 @@
 package iovplug
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 
 	"github.com/vishvananda/netlink"
@@ -114,7 +116,7 @@ func (d *driver) createNetwork(w http.ResponseWriter, r *http.Request) {
 		Dst:       d.ipnet,
 	}
 	if err := netlink.RouteAdd(route); err != nil {
-		panic(err)
+		Warn.Printf("error adding link-scope route: %s\n", err)
 	}
 
 	//d.iom.createIOModule(&req)
@@ -262,9 +264,9 @@ func (d *driver) createEndpoint(w http.ResponseWriter, r *http.Request) {
 	ip4, ip6 := ipsFromEndpointRequest(&req)
 
 	if tag := tagFromEndpointOptions(req.Options); tag != "" {
-		Debug.Printf("set ip2grp %s -> %d\n", req.Interface.Address, tag)
-		file := fmt.Sprintf("/run/bcc/foo/maps/ip2grp/{ 0x%02x%02x%02x%02x 0x0  }",
-			ip4[0], ip4[1], ip4[2], ip4[3])
+		ip := binary.BigEndian.Uint32(ip4)
+		file := fmt.Sprintf("/run/bcc/foo/maps/ip2grp/{ 0x%x 0x0  }", ip)
+		Debug.Printf("set ip2grp %s -> %s\n", ip4.String(), tag)
 		if err := ioutil.WriteFile(file, []byte(tag), 0644); err != nil {
 			panic(err)
 		}
@@ -294,10 +296,24 @@ func (d *driver) deleteEndpoint(w http.ResponseWriter, r *http.Request) {
 	}
 	Debug.Printf("driver.deleteEndpoint %s\n", &req)
 
-	_, ok := d.interfaces[req.EndpointID]
+	ips, ok := d.interfaces[req.EndpointID]
 	if !ok {
 		panic(fmt.Errorf("cannot find endpoint %s", req.EndpointID))
 	}
+	ip4 := ips[0]
+	if ip4 != nil {
+		ip := binary.BigEndian.Uint32(ip4)
+		file := fmt.Sprintf("/run/bcc/foo/maps/ip2grp/{ 0x%x 0x0  }", ip)
+		if err := os.Remove(file); err != nil {
+			Warn.Printf("cannot remove %s:\n", file, err)
+		}
+	}
+	//ip6 := ips[1]
+	//if ip6 != nil {
+	//	file := fmt.Sprintf("/run/bcc/foo/maps/ip2grp/{ 0x%02x%02x%02x%02x 0x0  }",
+	//		ip4[0], ip4[1], ip4[2], ip4[3])
+	//	os.Remove(file)
+	//}
 
 	linkName := endpointToLink(req.EndpointID)
 
@@ -305,10 +321,10 @@ func (d *driver) deleteEndpoint(w http.ResponseWriter, r *http.Request) {
 
 	if link, err := netlink.LinkByName(linkName); err == nil {
 		if err := netlink.LinkDel(link); err != nil {
-			Warn.Printf("unable to cleanup link %s while deleting endpoint", linkName)
+			Warn.Printf("unable to cleanup link %s while deleting endpoint\n", linkName)
 		}
 	} else {
-		Warn.Printf("unable to find link %s while deleting endpoint", linkName)
+		Warn.Printf("unable to find link %s while deleting endpoint\n", linkName)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
