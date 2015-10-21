@@ -31,7 +31,6 @@ type driver struct {
 	hostLink   netlink.Link
 	ip         net.IP
 	ipnet      *net.IPNet
-	usedIPs    map[string]string
 	interfaces map[string][]net.IP
 	iom        *ioModuleClient
 }
@@ -80,22 +79,7 @@ func NewDriver(config *Config) (*driver, error) {
 		ip:         ip,
 		ipnet:      ipnet,
 		hostLink:   link,
-		usedIPs:    make(map[string]string),
 		interfaces: make(map[string][]net.IP),
-	}
-	d.usedIPs[ip.String()] = ""
-	Debug.Printf("consuming %s\n", ip)
-	d.usedIPs[ipnet.IP.String()] = ""
-	Debug.Printf("consuming %s\n", ipnet.IP)
-	d.usedIPs[config.Gateway] = ""
-	Debug.Printf("consuming %s\n", config.Gateway)
-
-	// Mark as provisioned the IPs owned by the host interface
-	for _, addr := range addrs {
-		if ipnet.Contains(addr.IP) {
-			d.usedIPs[addr.IP.String()] = ""
-			Debug.Printf("consuming %s\n", addr.IP)
-		}
 	}
 
 	//d.iom = &ioModuleClient{
@@ -288,11 +272,6 @@ func (d *driver) createEndpoint(w http.ResponseWriter, r *http.Request) {
 
 	ips := []net.IP{ip4, ip6}
 	d.interfaces[req.EndpointID] = ips
-	for _, ip := range ips {
-		if ip != nil {
-			d.usedIPs[ip.String()] = req.EndpointID
-		}
-	}
 
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprint(w, `{"Value": {}}`)
@@ -315,7 +294,7 @@ func (d *driver) deleteEndpoint(w http.ResponseWriter, r *http.Request) {
 	}
 	Debug.Printf("driver.deleteEndpoint %s\n", &req)
 
-	ips, ok := d.interfaces[req.EndpointID]
+	_, ok := d.interfaces[req.EndpointID]
 	if !ok {
 		panic(fmt.Errorf("cannot find endpoint %s", req.EndpointID))
 	}
@@ -323,11 +302,6 @@ func (d *driver) deleteEndpoint(w http.ResponseWriter, r *http.Request) {
 	linkName := endpointToLink(req.EndpointID)
 
 	defer delete(d.interfaces, req.EndpointID)
-	for _, ip := range ips {
-		if ip != nil {
-			defer delete(d.usedIPs, ip.String())
-		}
-	}
 
 	if link, err := netlink.LinkByName(linkName); err == nil {
 		if err := netlink.LinkDel(link); err != nil {
