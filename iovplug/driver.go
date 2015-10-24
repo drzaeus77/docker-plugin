@@ -27,6 +27,8 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+const protoMagic int = 0
+
 type driver struct {
 	config     *Config
 	networkID  string
@@ -218,6 +220,15 @@ func tagFromEndpointOptions(options map[string]interface{}) string {
 		port, ok := exposedPort["Port"]
 		if !ok {
 			continue
+		}
+		proto, ok := exposedPort["Proto"]
+		if !ok {
+			continue
+		}
+		if val, ok := proto.(float64); ok {
+			if int(val) != protoMagic {
+				continue
+			}
 		}
 		if val, ok := port.(float64); ok {
 			return strconv.Itoa(int(val))
