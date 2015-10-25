@@ -36,7 +36,6 @@ type driver struct {
 	ip         net.IP
 	ipnet      *net.IPNet
 	interfaces map[string][]net.IP
-	iom        *ioModuleClient
 }
 
 func NewDriver(config *Config) (*driver, error) {
@@ -86,14 +85,6 @@ func NewDriver(config *Config) (*driver, error) {
 		interfaces: make(map[string][]net.IP),
 	}
 
-	//d.iom = &ioModuleClient{
-	//	client:  &http.Client{},
-	//	baseUrl: "http://localhost:5000",
-	//}
-	//if err := d.iom.discover(); err != nil {
-	//	return nil, err
-	//}
-
 	return d, nil
 }
 
@@ -120,8 +111,6 @@ func (d *driver) createNetwork(w http.ResponseWriter, r *http.Request) {
 	if err := netlink.RouteAdd(route); err != nil {
 		Warn.Printf("error adding link-scope route: %s\n", err)
 	}
-
-	//d.iom.createIOModule(&req)
 
 	d.networkID = req.NetworkID
 	Debug.Println("driver.createNetwork", req.NetworkID, req.Options)
@@ -154,7 +143,6 @@ func (d *driver) deleteNetwork(w http.ResponseWriter, r *http.Request) {
 	}
 
 	d.networkID = ""
-	//d.iom.deleteIOModule(&req)
 
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprint(w, `{}`)
@@ -414,14 +402,11 @@ func (d *driver) join(w http.ResponseWriter, r *http.Request) {
 		panic(err)
 	}
 
-	//d.iom.connectLink(d.networkID, newLink.Name)
-
 	resp := &joinResponse{
 		InterfaceName: &interfaceName{
 			SrcName:   newLink.Name,
 			DstPrefix: "eth",
 		},
-		// uncomment for L3 mode
 		StaticRoutes: []*staticRoute{
 			&staticRoute{
 				Destination: "0.0.0.0/0",
